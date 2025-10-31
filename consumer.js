@@ -1,107 +1,130 @@
-import "dotenv/config";
-import { Kafka, logLevel } from "kafkajs";
-import connectDB from "./config/db.js";
-import Order from "./models/Order.js";
+import 'dotenv/config'; 
+import { Kafka, logLevel } from 'kafkajs';
+import connectDB from './config/db.js';
+import Order from './models/Order.js';
+import { getProducer } from './lib/kafka.js';
 
-const brokers = (process.env.KAFKA_BROKERS || "localhost:9092").split(",");
+
+const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || 'localhost:9092').split(',');
+const ORDER_TOPIC = process.env.KAFKA_ORDER_TOPIC || 'orders';
+const DLQ_TOPIC = process.env.KAFKA_ORDER_DLQ_TOPIC || 'orders_dlq';
+const FAILURE_TOPIC = process.env.KAFKA_ORDER_FAILURE_TOPIC || 'order_failures';
+const CONSUMER_GROUP_ID = process.env.KAFKA_CONSUMER_GROUP_ID || 'order-processing-group';
+
+
 const kafka = new Kafka({
-  clientId: "order-processor",
-  brokers: brokers,
+  clientId: 'order-processor',
+  brokers: KAFKA_BROKERS,
   logLevel: logLevel.INFO,
+
 });
 
-const consumer = kafka.consumer({ groupId: "order-processing-group" });
+const consumer = kafka.consumer({ groupId: CONSUMER_GROUP_ID });
 
 const runConsumer = async () => {
   try {
     await connectDB();
-    console.log("MongoDB Connected for Consumer.");
+    console.log('MongoDB Connected for Consumer.');
   } catch (dbError) {
-    console.error("Consumer failed to connect to MongoDB:", dbError);
+    console.error('Consumer failed to connect to MongoDB:', dbError);
     process.exit(1);
   }
 
   try {
     await consumer.connect();
-    console.log("Kafka Consumer Connected.");
-    await consumer.subscribe({ topic: "orders", fromBeginning: false });
-    console.log('Subscribed to "orders" topic.');
+    console.log('Kafka Consumer Connected.');
+    await consumer.subscribe({ topic: ORDER_TOPIC, fromBeginning: false });
+    console.log(`Subscribed to "${ORDER_TOPIC}" topic.`);
 
     await consumer.run({
       eachMessage: async ({ topic, partition, message }) => {
-        console.log(
-          `Received message from partition ${partition}: ${message.value.toString()}`
-        );
         let orderDataPayload;
+        let rawMessage;
+        let order; 
 
         try {
-          const rawMessage = JSON.parse(message.value.toString());
+          rawMessage = JSON.parse(message.value.toString());
 
-          if (rawMessage.eventType !== "OrderCreated" || !rawMessage.payload) {
-            console.warn(
-              "Received message is not a valid OrderCreated event:",
-              rawMessage
-            );
 
-            return;
+          if (rawMessage.eventType !== 'OrderProcessingRequested' || !rawMessage.payload) {
+            console.warn('Received message is not a valid OrderProcessingRequested event:', rawMessage);
+            return; 
           }
           orderDataPayload = rawMessage.payload;
+          const { orderId, userId, items } = orderDataPayload;
+          const eventId = rawMessage.eventId;
 
-          console.log(
-            `Processing order for user: ${orderDataPayload.userId}, Event ID: ${rawMessage.eventId}`
-          );
 
-          const newOrder = new Order({
-            userId: orderDataPayload.userId,
+          order = await Order.findById(orderId);
+          if (!order) {
+            console.warn(`Order ${orderId} not found. Message might be invalid or DB is lagging.`);
+            throw new Error(`Order ${orderId} not found.`);
+          }
 
-            items: orderDataPayload.items.map((item) => ({
-              product: item.productId,
-              quantity: item.quantity,
-            })),
-            amount: orderDataPayload.amount,
-            address: orderDataPayload.address,
-            status: "Processing",
-            date: new Date(orderDataPayload.orderDate),
-          });
-          await newOrder.save();
-          console.log(
-            `Order ${newOrder._id} saved successfully for user ${orderDataPayload.userId}.`
-          );
+          if (order.status !== 'Pending') {
+            console.log(`Order ${orderId} already processed (Status: ${order.status}). Skipping message.`);
+            return; 
+          }
 
-          console.log(`TODO: Update inventory for order ${newOrder._id}`);
+          order.status = 'Processing';
+          order.eventId = eventId; 
+          await order.save();
+          console.log(`Processing Order ${order._id} for user ${userId}.`);
 
-          console.log(
-            `TODO: Send order confirmation email for order ${newOrder._id}`
-          );
+          console.log(`(Skipping inventory/notifications) Marking Order ${order._id} as Confirmed.`);
+        order.status = 'Confirmed'; 
+        await order.save(); 
+        
+        console.log(`Finished processing Order ${order._id}. Status: ${order.status}`);
 
-          newOrder.status = "Confirmed";
-          await newOrder.save();
-          console.log(`Order ${newOrder._id} status updated to Confirmed.`);
-        } catch (error) {
-          console.error(
-            `Error processing message for Event ID ${
-              orderDataPayload?.eventId || "unknown"
-            }:`,
-            error
-          );
-        }
-      },
-    });
+        } catch (error) { 
+          console.error(`FATAL: Error processing message, sending to DLQ. OrderID: ${order?._id}, EventID: ${rawMessage?.eventId}`, error);
+          
+          try {
+            const dlqProducer = await getProducer();
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            const errorStack = error instanceof Error ? error.stack : 'N/A';
+
+            await dlqProducer.send({
+              topic: DLQ_TOPIC,
+              messages: [{
+                key: message.key,
+                value: message.value,
+                headers: {
+                  processingError: errorMessage,
+                  errorStack: errorStack,
+                  originalTopic: topic,
+                  originalPartition: String(partition),
+                  originalOffset: message.offset,
+                  consumerGroupId: CONSUMER_GROUP_ID,
+                  timestamp: String(Date.now())
+                }
+              }]
+            });
+            console.log(`Message sent to DLQ topic: ${DLQ_TOPIC}`);
+          } catch (dlqError) {
+            console.error(`CRITICAL: Failed to send message to DLQ:`, dlqError);
+          }
+        } 
+      }, 
+    }); 
+
   } catch (consumerError) {
-    console.error("Kafka Consumer error:", consumerError);
+    console.error('Kafka Consumer fatal error:', consumerError);
     process.exit(1);
   }
 };
 
-const errorTypes = ["unhandledRejection", "uncaughtException"];
-const signalTraps = ["SIGTERM", "SIGINT", "SIGUSR2"];
 
-errorTypes.forEach((type) => {
+const errorTypes = ['unhandledRejection', 'uncaughtException'];
+const signalTraps = ['SIGTERM', 'SIGINT', 'SIGUSR2'];
+
+errorTypes.forEach(type => {
   process.on(type, async (err) => {
     try {
       console.error(`Unhandled error: ${err}`, err.stack);
       await consumer.disconnect();
-      console.log("Kafka Consumer disconnected due to error.");
+      console.log('Kafka Consumer disconnected due to error.');
       process.exit(1);
     } catch (_) {
       process.exit(1);
@@ -109,12 +132,12 @@ errorTypes.forEach((type) => {
   });
 });
 
-signalTraps.forEach((type) => {
+signalTraps.forEach(type => {
   process.once(type, async () => {
     try {
       console.log(`Received ${type}, shutting down consumer...`);
       await consumer.disconnect();
-      console.log("Kafka Consumer disconnected gracefully.");
+      console.log('Kafka Consumer disconnected gracefully.');
     } finally {
       process.kill(process.pid, type);
     }
